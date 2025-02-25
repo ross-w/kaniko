@@ -956,6 +956,70 @@ func getSymlink(path string) error {
 	return nil
 }
 
+// IsAccessibleThroughSymlink checks if a file is accessible through any symlink in the given paths.
+// This is a critical function for preventing file duplication in layers.
+//
+// The function works by:
+// 1. Resolving the absolute path of the file being checked
+// 2. Examining each file in the provided paths to see if it's a symlink
+// 3. For each symlink, resolving its target and comparing with the file being checked
+//
+// This approach ensures that files accessible through symlinks are not duplicated in layers,
+// which improves layer efficiency and reduces image size.
+//
+// Parameters:
+// - path: The path of the file to check
+// - paths: A map of all paths to check against (typically all files in the current layer)
+//
+// Returns true if the file is accessible through a symlink, false otherwise.
+func IsAccessibleThroughSymlink(path string, paths map[string]struct{}) bool {
+	// Get the absolute path of the file
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		logrus.Debugf("Error getting absolute path for %s: %v", path, err)
+		return false
+	}
+
+	// Check if any file in the paths is a symlink pointing to our file
+	for filePath := range paths {
+		// Skip the file itself
+		if filePath == path {
+			continue
+		}
+
+		// Check if the file is a symlink
+		fi, err := os.Lstat(filePath)
+		if err != nil {
+			continue
+		}
+
+		if IsSymlink(fi) {
+			// Get the symlink target
+			linkTarget, err := os.Readlink(filePath)
+			if err != nil {
+				logrus.Debugf("Error reading symlink %s: %v", filePath, err)
+				continue
+			}
+
+			// If the target is not absolute, make it absolute
+			if !filepath.IsAbs(linkTarget) {
+				linkTarget = filepath.Join(filepath.Dir(filePath), linkTarget)
+			}
+
+			// Clean both paths for comparison
+			linkTarget = filepath.Clean(linkTarget)
+			
+			// Check if the symlink points to our file
+			if linkTarget == absPath {
+				logrus.Debugf("File %s is accessible through symlink %s", path, filePath)
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
 // For cross stage dependencies kaniko must persist the referenced path so that it can be used in
 // the dependent stage. For symlinks we copy the target path because copying the symlink would
 // result in a dead link

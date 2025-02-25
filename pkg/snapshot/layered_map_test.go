@@ -17,6 +17,9 @@ limitations under the License.
 package snapshot
 
 import (
+	"io/ioutil"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -141,4 +144,113 @@ func Test_FlattenPaths(t *testing.T) {
 	assertPath("a", true)
 	assertPath("b", false)
 	assertPath("c", false)
+}
+
+func Test_isAccessibleThroughSymlink(t *testing.T) {
+	// Create a temporary directory for testing
+	tempDir, err := ioutil.TempDir("", "layered-map-test")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	// Create a test file
+	testFilePath := filepath.Join(tempDir, "test-file")
+	if err := ioutil.WriteFile(testFilePath, []byte("test content"), 0644); err != nil {
+		t.Fatalf("Failed to create test file: %v", err)
+	}
+
+	// Create a symlink to the test file
+	symlinkPath := filepath.Join(tempDir, "test-symlink")
+	if err := os.Symlink(testFilePath, symlinkPath); err != nil {
+		t.Fatalf("Failed to create symlink: %v", err)
+	}
+
+	// Create a LayeredMap with the test file and symlink
+	lm := NewLayeredMap(func(s string) (string, error) {
+		return "dummy-hash", nil
+	})
+	lm.Snapshot()
+
+	// Add the test file and symlink to the current image
+	lm.currentImage = map[string]string{
+		testFilePath: "hash1",
+		symlinkPath:  "hash2",
+	}
+
+	// Test that the file is accessible through the symlink
+	if !lm.isAccessibleThroughSymlink(testFilePath) {
+		t.Errorf("Expected file to be accessible through symlink, but it wasn't")
+	}
+
+	// Create another file that is not linked
+	unlinkedFilePath := filepath.Join(tempDir, "unlinked-file")
+	if err := ioutil.WriteFile(unlinkedFilePath, []byte("unlinked content"), 0644); err != nil {
+		t.Fatalf("Failed to create unlinked file: %v", err)
+	}
+
+	// Add the unlinked file to the current image
+	lm.currentImage[unlinkedFilePath] = "hash3"
+
+	// Test that the unlinked file is not accessible through any symlink
+	if lm.isAccessibleThroughSymlink(unlinkedFilePath) {
+		t.Errorf("Expected unlinked file to not be accessible through symlink, but it was")
+	}
+}
+
+func Test_CheckFileChange_WithSymlinks(t *testing.T) {
+	// Create a temporary directory for testing
+	tempDir, err := ioutil.TempDir("", "layered-map-test")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	// Create a test file
+	testFilePath := filepath.Join(tempDir, "test-file")
+	if err := ioutil.WriteFile(testFilePath, []byte("test content"), 0644); err != nil {
+		t.Fatalf("Failed to create test file: %v", err)
+	}
+
+	// Create a symlink to the test file
+	symlinkPath := filepath.Join(tempDir, "test-symlink")
+	if err := os.Symlink(testFilePath, symlinkPath); err != nil {
+		t.Fatalf("Failed to create symlink: %v", err)
+	}
+
+	// Create a LayeredMap with a mock hasher that always returns the same hash
+	lm := NewLayeredMap(func(s string) (string, error) {
+		return "dummy-hash", nil
+	})
+	lm.Snapshot()
+
+	// Add the symlink to the current image
+	lm.currentImage = map[string]string{
+		symlinkPath: "symlink-hash",
+	}
+
+	// Test that CheckFileChange returns false (unchanged) for the test file
+	// because it's accessible through the symlink
+	changed, err := lm.CheckFileChange(testFilePath)
+	if err != nil {
+		t.Fatalf("CheckFileChange failed: %v", err)
+	}
+	if changed {
+		t.Errorf("Expected CheckFileChange to return false (unchanged) for file accessible through symlink, but got true")
+	}
+
+	// Create another file that is not linked
+	unlinkedFilePath := filepath.Join(tempDir, "unlinked-file")
+	if err := ioutil.WriteFile(unlinkedFilePath, []byte("unlinked content"), 0644); err != nil {
+		t.Fatalf("Failed to create unlinked file: %v", err)
+	}
+
+	// Test that CheckFileChange returns true (changed) for the unlinked file
+	changed, err = lm.CheckFileChange(unlinkedFilePath)
+	if err != nil {
+		t.Fatalf("CheckFileChange failed: %v", err)
+	}
+	if !changed {
+		t.Errorf("Expected CheckFileChange to return true (changed) for unlinked file, but got false")
+	}
 }

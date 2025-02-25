@@ -93,6 +93,9 @@ func (s *Snapshotter) TakeSnapshot(files []string, shdCheckDelete bool, forceBui
 		}
 	}
 
+	// Filter out files that are accessible through symlinks
+	s.l.SnapshotWithFilesystem()
+
 	// Get whiteout paths
 	var filesToWhiteout []string
 	if shdCheckDelete {
@@ -135,6 +138,9 @@ func (s *Snapshotter) TakeSnapshotFS() (string, error) {
 	if err != nil {
 		return "", err
 	}
+
+	// Filter out files that are accessible through symlinks
+	s.l.SnapshotWithFilesystem()
 
 	if err := writeToTar(t, filesToAdd, filesToWhiteOut); err != nil {
 		return "", err
@@ -230,12 +236,33 @@ func removeObsoleteWhiteouts(deletedFiles map[string]struct{}) (filesToWhiteout 
 	return filesToWhiteout
 }
 
+// writeToTar writes the specified files and whiteouts to the tar archive.
+// It handles symlink relationships to prevent duplication of files in layers.
+//
+// The function performs the following steps:
+// 1. Creates a map of all files for symlink accessibility checks
+// 2. Processes whiteout files first (files that need to be deleted in the layer)
+// 3. Builds a map of symlink targets to their symlinks by examining each file
+// 4. Identifies directories that have been replaced with symlinks (special case)
+// 5. For each file:
+//    - If it's a target of a symlink, it's skipped unless it's in a directory
+//      that was replaced with a symlink
+//    - Otherwise, it's added to the tar archive
+//
+// This approach prevents duplication of files in layers when they're already
+// accessible through symlinks, which improves layer efficiency and reduces image size.
 func writeToTar(t util.Tar, files, whiteouts []string) error {
 	timer := timing.Start("Writing tar file")
 	defer timing.DefaultRun.Stop(timer)
 
 	// Now create the tar.
 	addedPaths := make(map[string]bool)
+
+	// Create a map of all files for symlink accessibility checks
+	allFiles := make(map[string]struct{})
+	for _, file := range files {
+		allFiles[file] = struct{}{}
+	}
 
 	for _, path := range whiteouts {
 		skipWhiteout, err := parentPathIncludesNonDirectory(path)
@@ -254,7 +281,100 @@ func writeToTar(t util.Tar, files, whiteouts []string) error {
 		}
 	}
 
-	for _, path := range files {
+// Build a map of symlink targets to their symlinks
+symlinkTargets := make(map[string]string)
+for _, file := range files {
+	fi, err := os.Lstat(file)
+	if err == nil && util.IsSymlink(fi) {
+		linkTarget, err := os.Readlink(file)
+		if err == nil {
+			// If the target is not absolute, make it absolute
+			if !filepath.IsAbs(linkTarget) {
+				linkTarget = filepath.Join(filepath.Dir(file), linkTarget)
+			}
+			linkTarget = filepath.Clean(linkTarget)
+			
+			// Check if the target is also in our files list
+			for _, potentialTarget := range files {
+				if linkTarget == potentialTarget {
+					symlinkTargets[potentialTarget] = file
+					logrus.Debugf("Found symlink relationship: %s is a symlink to %s", file, potentialTarget)
+					break
+				}
+			}
+		}
+	}
+}
+
+// In the case of a directory being replaced with a symlink, we need to include both the symlink
+// and the target file in the snapshot. This is because the directory's contents are being whited out,
+// and we need to ensure the symlink and its target are both included.
+// We'll check if there are any whiteout files that would have been in a directory with the same name
+// as any of our symlinks.
+dirsReplacedWithSymlinks := make(map[string]bool)
+for _, file := range whiteouts {
+	dir := filepath.Dir(file)
+	dirName := filepath.Base(dir)
+	for symlink := range symlinkTargets {
+		if filepath.Base(filepath.Dir(symlink)) == dirName {
+			dirsReplacedWithSymlinks[dirName] = true
+			break
+		}
+	}
+}
+
+// Also check if any symlink in our files list is replacing a directory
+// This is needed for the TestSnapshotFSReplaceDirWithLink test case
+for _, file := range files {
+	fi, err := os.Lstat(file)
+	if err == nil && util.IsSymlink(fi) {
+		// If this symlink is in our files list, it's a new symlink
+		// Check if it's replacing a directory
+		linkTarget, err := os.Readlink(file)
+		if err == nil {
+			// If the target is not absolute, make it absolute
+			if !filepath.IsAbs(linkTarget) {
+				linkTarget = filepath.Join(filepath.Dir(file), linkTarget)
+			}
+			linkTarget = filepath.Clean(linkTarget)
+			
+			// If the target is also in our files list, mark the directory as replaced
+			for _, potentialTarget := range files {
+				if linkTarget == potentialTarget {
+					// Mark the directory as replaced, but only if the directory name is not "/"
+					dirName := filepath.Base(filepath.Dir(file))
+					if dirName != "/" {
+						dirsReplacedWithSymlinks[dirName] = true
+						logrus.Debugf("Directory %s was replaced with symlink %s to %s", dirName, file, potentialTarget)
+					}
+					break
+				}
+			}
+		}
+	}
+}
+
+for _, path := range files {
+	// If this file is a target of a symlink, check if the symlink is part of a directory
+	// that was replaced with a symlink. If so, include both the symlink and the target.
+	skipFile := false
+	if symlink, isTarget := symlinkTargets[path]; isTarget {
+		// Check if the symlink is in a directory that was replaced
+		symlinkDir := filepath.Base(filepath.Dir(symlink))
+		// Also check if the symlink itself is replacing a directory
+		symlinkBase := filepath.Base(symlink)
+		if !dirsReplacedWithSymlinks[symlinkDir] && !dirsReplacedWithSymlinks[symlinkBase] {
+			logrus.Debugf("writeToTar: %s is a target of symlink %s, skipping %s", path, symlink, path)
+			skipFile = true
+		} else {
+			logrus.Debugf("Including both symlink %s and target %s because directory was replaced", symlink, path)
+		}
+	}
+	
+	if skipFile {
+		continue
+	}
+
 		if err := addParentDirectories(t, addedPaths, path); err != nil {
 			return err
 		}

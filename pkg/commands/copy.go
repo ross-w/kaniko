@@ -97,6 +97,15 @@ func (c *CopyCommand) ExecuteCommand(config *v1.Config, buildArgs *dockerfile.Bu
 			return errors.Wrap(err, "resolving dest symlink")
 		}
 
+		// We don't need to check if the destination is accessible through a symlink
+		// when copying files. The symlink accessibility check is only needed when
+		// deciding which files to include in a layer, which is handled in FilesToSnapshot.
+		// The resolveIfSymlink function above already handles resolving the symlink path.
+		
+		// Note: Previously, we were checking if the destination was accessible through a symlink
+		// and skipping it if it was. This caused issues when copying to a directory that was
+		// itself a symlink, as we would skip copying all files.
+
 		if fi.IsDir() {
 			copiedFiles, err := util.CopyDir(fullPath, destPath, c.fileContext, uid, gid, chmod, useDefaultChmod)
 			if err != nil {
@@ -104,7 +113,7 @@ func (c *CopyCommand) ExecuteCommand(config *v1.Config, buildArgs *dockerfile.Bu
 			}
 			c.snapshotFiles = append(c.snapshotFiles, copiedFiles...)
 		} else if util.IsSymlink(fi) {
-			// If file is a symlink, we want to copy the target file to destPath
+			// If file is a symlink, preserve it by creating a new symlink
 			exclude, err := util.CopySymlink(fullPath, destPath, c.fileContext)
 			if err != nil {
 				return errors.Wrap(err, "copying symlink")
@@ -128,9 +137,78 @@ func (c *CopyCommand) ExecuteCommand(config *v1.Config, buildArgs *dockerfile.Bu
 	return nil
 }
 
-// FilesToSnapshot should return an empty array if still nil; no files were changed
+// FilesToSnapshot returns a list of files that should be included in the snapshot.
+// It filters out files that are accessible through symlinks to prevent duplication in layers.
+// 
+// The function performs the following steps:
+// 1. Creates a map of all files in the snapshot for symlink accessibility checks
+// 2. Identifies symlink relationships between files by examining each file to see if it's a symlink
+//    and determining its target
+// 3. Filters out files that are targets of symlinks (they don't need to be included since they're
+//    accessible through the symlink)
+// 4. Filters out files that are accessible through symlinks using IsAccessibleThroughSymlink
+//
+// This approach prevents duplication of files in layers when they're already accessible through symlinks,
+// which improves layer efficiency and reduces image size.
+//
+// Returns a filtered list of files to be included in the snapshot.
 func (c *CopyCommand) FilesToSnapshot() []string {
-	return c.snapshotFiles
+	// If no files were changed, return an empty array
+	if len(c.snapshotFiles) == 0 {
+		return []string{}
+	}
+
+	logrus.Debugf("CopyCommand.FilesToSnapshot called with %d files", len(c.snapshotFiles))
+	for _, file := range c.snapshotFiles {
+		logrus.Debugf("CopyCommand.FilesToSnapshot: file=%s", file)
+	}
+
+	// Create a map of all files in the snapshot for symlink accessibility checks
+	allFiles := make(map[string]struct{})
+	for _, file := range c.snapshotFiles {
+		allFiles[file] = struct{}{}
+	}
+
+	// Build a map of symlink targets to their symlinks
+	symlinkTargets := make(map[string]string)
+	for _, file := range c.snapshotFiles {
+		fi, err := os.Lstat(file)
+		if err == nil && util.IsSymlink(fi) {
+			linkTarget, err := os.Readlink(file)
+			if err == nil {
+				// If the target is not absolute, make it absolute
+				if !filepath.IsAbs(linkTarget) {
+					linkTarget = filepath.Join(filepath.Dir(file), linkTarget)
+				}
+				linkTarget = filepath.Clean(linkTarget)
+				
+				// Check if the target is also in our snapshot files
+				for _, potentialTarget := range c.snapshotFiles {
+					if linkTarget == potentialTarget {
+						symlinkTargets[potentialTarget] = file
+						logrus.Debugf("Found symlink relationship: %s is a symlink to %s", file, potentialTarget)
+						break
+					}
+				}
+			}
+		}
+	}
+
+	// Filter out files that are targets of symlinks or accessible through symlinks
+	var filteredFiles []string
+	for _, file := range c.snapshotFiles {
+		if symlink, isTarget := symlinkTargets[file]; isTarget {
+			logrus.Debugf("FilesToSnapshot: %s is a target of symlink %s, skipping", file, symlink)
+			continue
+		} else if !util.IsAccessibleThroughSymlink(file, allFiles) {
+			filteredFiles = append(filteredFiles, file)
+		} else {
+			logrus.Debugf("File %s is accessible through a symlink, not adding to snapshot", file)
+		}
+	}
+
+	logrus.Debugf("CopyCommand.FilesToSnapshot returning %d files", len(filteredFiles))
+	return filteredFiles
 }
 
 // String returns some information about the command for the image config
@@ -211,11 +289,61 @@ func (cr *CachingCopyCommand) FilesUsedFromContext(config *v1.Config, buildArgs 
 }
 
 func (cr *CachingCopyCommand) FilesToSnapshot() []string {
-	f := cr.extractedFiles
-	logrus.Debugf("%d files extracted by caching copy command", len(f))
-	logrus.Tracef("Extracted files: %s", f)
+	// If no files were extracted, return an empty array
+	if len(cr.extractedFiles) == 0 {
+		return []string{}
+	}
 
-	return f
+	logrus.Debugf("CachingCopyCommand.FilesToSnapshot called with %d files", len(cr.extractedFiles))
+	logrus.Debugf("%d files extracted by caching copy command", len(cr.extractedFiles))
+	logrus.Tracef("Extracted files: %s", cr.extractedFiles)
+
+	// Create a map of all files in the snapshot for symlink accessibility checks
+	allFiles := make(map[string]struct{})
+	for _, file := range cr.extractedFiles {
+		allFiles[file] = struct{}{}
+	}
+
+	// Build a map of symlink targets to their symlinks
+	symlinkTargets := make(map[string]string)
+	for _, file := range cr.extractedFiles {
+		fi, err := os.Lstat(file)
+		if err == nil && util.IsSymlink(fi) {
+			linkTarget, err := os.Readlink(file)
+			if err == nil {
+				// If the target is not absolute, make it absolute
+				if !filepath.IsAbs(linkTarget) {
+					linkTarget = filepath.Join(filepath.Dir(file), linkTarget)
+				}
+				linkTarget = filepath.Clean(linkTarget)
+				
+				// Check if the target is also in our extracted files
+				for _, potentialTarget := range cr.extractedFiles {
+					if linkTarget == potentialTarget {
+						symlinkTargets[potentialTarget] = file
+						logrus.Debugf("Found symlink relationship: %s is a symlink to %s", file, potentialTarget)
+						break
+					}
+				}
+			}
+		}
+	}
+
+	// Filter out files that are targets of symlinks or accessible through symlinks
+	var filteredFiles []string
+	for _, file := range cr.extractedFiles {
+		if symlink, isTarget := symlinkTargets[file]; isTarget {
+			logrus.Debugf("CachingCopyCommand.FilesToSnapshot: %s is a target of symlink %s, skipping", file, symlink)
+			continue
+		} else if !util.IsAccessibleThroughSymlink(file, allFiles) {
+			filteredFiles = append(filteredFiles, file)
+		} else {
+			logrus.Debugf("File %s is accessible through a symlink, not adding to snapshot", file)
+		}
+	}
+
+	logrus.Debugf("CachingCopyCommand.FilesToSnapshot returning %d files", len(filteredFiles))
+	return filteredFiles
 }
 
 func (cr *CachingCopyCommand) MetadataOnly() bool {
